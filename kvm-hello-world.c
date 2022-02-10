@@ -169,14 +169,23 @@ int run_vm(struct vm *vm, struct vcpu *vcpu, size_t sz)
 			goto check;
 
 		case KVM_EXIT_IO:
-			if (vcpu->kvm_run->io.direction == KVM_EXIT_IO_OUT
-			    && vcpu->kvm_run->io.port == 0xE9) {
-				char *p = (char *)vcpu->kvm_run;
-				fwrite(p + vcpu->kvm_run->io.data_offset,
-				       vcpu->kvm_run->io.size, 1, stdout);
-				fflush(stdout);
-				continue;
-			}
+			if (vcpu->kvm_run->io.direction == KVM_EXIT_IO_OUT) {
+                if (vcpu->kvm_run->io.port == 0xE9) {
+                    char *p = (char *)vcpu->kvm_run;
+                    fwrite(p + vcpu->kvm_run->io.data_offset,
+                           vcpu->kvm_run->io.size, 1, stdout);
+                } else if (vcpu->kvm_run->io.port == 0xEA) {
+                    char *value_ptr = (char *)vcpu->kvm_run + vcpu->kvm_run->io.data_offset;
+                    uint32_t value = *(uint32_t *)value_ptr;
+
+                    char *vm_base = (char *)vm->mem;
+                    char *str_ptr = vm_base + value;
+                    fprintf(stdout, "%s\n", str_ptr);
+                }
+
+                fflush(stdout);
+                continue;
+            }
 
 			/* fall through */
 		default:
@@ -448,6 +457,8 @@ int main(int argc, char **argv)
 		LONG_MODE,
 	} mode = REAL_MODE;
 	int opt;
+
+    printf("PID = %d\n", getpid());
 
 	while ((opt = getopt(argc, argv, "rspl")) != -1) {
 		switch (opt) {
