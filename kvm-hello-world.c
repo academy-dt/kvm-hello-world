@@ -153,16 +153,47 @@ void vcpu_init(struct vm *vm, struct vcpu *vcpu)
     }
 }
 
+// Get IO data as uint32_t
+uint32_t kvm_data_get_u32(struct vcpu *vcpu)
+{
+    char *raw_ptr = (char *)vcpu->kvm_run + vcpu->kvm_run->io.data_offset;
+    uint32_t *value_ptr = (uint32_t *)raw_ptr;
+    return *value_ptr;
+}
+
+// Set IO data as uint32_t
+void kvm_data_set_u32(struct vcpu *vcpu, uint32_t value)
+{
+    char *raw_ptr = (char *)vcpu->kvm_run + vcpu->kvm_run->io.data_offset;
+    uint32_t *value_ptr = (uint32_t *)raw_ptr;
+    *value_ptr = value;
+}
+
+// Get IO data as char *
+char* kvm_data_str(struct vcpu *vcpu)
+{
+    return (char *)vcpu->kvm_run + vcpu->kvm_run->io.data_offset;
+}
+
+// Get a pointer to the guest's memory from the hosts perspective
+void *guest2host(struct vm *vm, uint64_t offset)
+{
+    return (char *)vm->mem + offset;
+}
+
 int run_vm(struct vm *vm, struct vcpu *vcpu, size_t sz)
 {
     struct kvm_regs regs;
     uint64_t memval = 0;
+    uint64_t vm_exits = 0;
 
     for (;;) {
         if (ioctl(vcpu->fd, KVM_RUN, 0) < 0) {
             perror("KVM_RUN");
             exit(1);
         }
+
+        ++vm_exits;
 
         switch (vcpu->kvm_run->exit_reason) {
         case KVM_EXIT_HLT:
@@ -175,15 +206,18 @@ int run_vm(struct vm *vm, struct vcpu *vcpu, size_t sz)
                     fwrite(p + vcpu->kvm_run->io.data_offset,
                            vcpu->kvm_run->io.size, 1, stdout);
                 } else if (vcpu->kvm_run->io.port == 0xEA) {
-                    char *value_ptr = (char *)vcpu->kvm_run + vcpu->kvm_run->io.data_offset;
-                    uint32_t value = *(uint32_t *)value_ptr;
-
-                    char *vm_base = (char *)vm->mem;
-                    char *str_ptr = vm_base + value;
-                    fprintf(stdout, "%s\n", str_ptr);
+                    int32_t offset = kvm_data_get_u32(vcpu);
+                    char *str = guest2host(vm, offset);
+                    fprintf(stdout, "%s\n", str);
                 }
 
                 fflush(stdout);
+                continue;
+            } else if (vcpu->kvm_run->io.direction == KVM_EXIT_IO_IN) {
+                if (vcpu->kvm_run->io.port == 0xEB) {
+                    kvm_data_set_u32(vcpu, vm_exits);
+                }
+
                 continue;
             }
 
