@@ -74,12 +74,20 @@
         fflush(stdout); \
     } while(0)
 
-/*
- * We assume that only a single "host"-file can be opened by the guest.
- * This is the FD for that file.
- */
-static int file_fd = -1;
-static int retval = 0;
+struct vcpu {
+    int fd;
+    struct kvm_run *kvm_run;
+};
+
+struct vexec {
+    pthread_t thread_id;
+    struct vcpu vcpu;
+    char *host_vm_base;
+    uint64_t guest_vm_offset;
+    int retval;
+    int file_fd;
+    uint64_t vm_exits;
+};
 
 struct vm {
     int sys_fd;
@@ -141,14 +149,9 @@ void vm_init(struct vm *vm, size_t mem_size)
     }
 }
 
-struct vcpu {
-    int fd;
-    struct kvm_run *kvm_run;
-};
-
-void vcpu_init(struct vm *vm, struct vcpu *vcpu)
+void vcpu_init(struct vm *vm, struct vcpu *vcpu, size_t id)
 {
-    vcpu->fd = ioctl(vm->fd, KVM_CREATE_VCPU, 0);
+    vcpu->fd = ioctl(vm->fd, KVM_CREATE_VCPU, id);
     if (vcpu->fd < 0) {
         perror("KVM_CREATE_VCPU");
         exit(1);
@@ -166,6 +169,8 @@ void vcpu_init(struct vm *vm, struct vcpu *vcpu)
         perror("mmap kvm_run");
         exit(1);
     }
+
+    LOG("%zu: VCPU kvm run @ %p", id, vcpu->kvm_run);
 }
 
 uint32_t get_u32(struct vcpu *vcpu)
@@ -175,19 +180,19 @@ uint32_t get_u32(struct vcpu *vcpu)
     return *value_ptr;
 }
 
-char *get_string(char *vm_base, struct vcpu *vcpu)
+char *get_string(char *host_vm_base, struct vcpu *vcpu)
 {
     uint32_t offset = get_u32(vcpu);
-    return vm_base + offset;
+    return host_vm_base + offset;
 }
 
-void get_buf_len(char *vm_base, struct vcpu *vcpu, void **buf, int *len)
+void get_buf_len(char *host_vm_base, struct vcpu *vcpu, void **buf, int *len)
 {
     uint32_t value = get_u32(vcpu);
     *len = value & LEN_MASK;
 
     uint32_t offset = value >> LEN_BITS;
-    *buf = vm_base + offset;
+    *buf = host_vm_base + offset;
 }
 
 void put_u32(struct vcpu *vcpu, uint32_t value)
@@ -197,18 +202,18 @@ void put_u32(struct vcpu *vcpu, uint32_t value)
     *value_ptr = value;
 }
 
-void handle_print(char *vm_base, struct vcpu *vcpu)
+void handle_print(char *host_vm_base, struct vcpu *vcpu)
 {
-    char *str = get_string(vm_base, vcpu);
+    char *str = get_string(host_vm_base, vcpu);
     LOG("Guest: %s", str);
 }
 
-int handle_open(char *vm_base, struct vcpu *vcpu)
+int handle_open(char *host_vm_base, struct vcpu *vcpu, int *file_fd)
 {
-    char *path = get_string(vm_base, vcpu);
+    char *path = get_string(host_vm_base, vcpu);
     LOG("Handling open(%s)", path);
 
-    if (file_fd != -1) {
+    if (*file_fd != -1) {
         LOG("Failed! Already open");
         return -EALREADY;
     }
@@ -217,8 +222,8 @@ int handle_open(char *vm_base, struct vcpu *vcpu)
      * Note: We chose O_CREATE and O_APPEND just because that was convenient for testing.
      * Any set of flags should work here.
      */
-    file_fd = open(path, O_RDWR | O_CREAT | O_APPEND, 0666);
-    if (file_fd == -1) {
+    *file_fd = open(path, O_RDWR | O_CREAT | O_APPEND, 0666);
+    if (*file_fd == -1) {
         LOG("Failed! Errno = %d", -errno);
         return -errno;
     }
@@ -226,19 +231,19 @@ int handle_open(char *vm_base, struct vcpu *vcpu)
     return 0;
 }
 
-int handle_read(char *vm_base, struct vcpu *vcpu)
+int handle_read(char *host_vm_base, struct vcpu *vcpu, int *file_fd)
 {
     void *buf;
     int len;
-    get_buf_len(vm_base, vcpu, &buf, &len);
+    get_buf_len(host_vm_base, vcpu, &buf, &len);
     LOG("Handling read(%p, %d)", buf, len);
 
-    if (file_fd == -1) {
+    if (*file_fd == -1) {
         LOG("Failed! No file open");
         return -EINVAL;
     }
 
-    int bytes = read(file_fd, buf, len);
+    int bytes = read(*file_fd, buf, len);
     if (bytes == -1) {
         LOG("Failed! Errno = %d", -errno);
         return -errno;
@@ -247,19 +252,19 @@ int handle_read(char *vm_base, struct vcpu *vcpu)
     return bytes;
 }
 
-int handle_write(char *vm_base, struct vcpu *vcpu)
+int handle_write(char *host_vm_base, struct vcpu *vcpu, int *file_fd)
 {
     void *buf;
     int len;
-    get_buf_len(vm_base, vcpu, &buf, &len);
+    get_buf_len(host_vm_base, vcpu, &buf, &len);
     LOG("Handling write(%p, %d)", buf, len);
 
-    if (file_fd == -1) {
+    if (*file_fd == -1) {
         LOG("Failed! No file open");
         return -EINVAL;
     }
 
-    int bytes = write(file_fd, buf, len);
+    int bytes = write(*file_fd, buf, len);
     if (bytes == -1) {
         LOG("Failed! Errno = %d", -errno);
         return -errno;
@@ -268,28 +273,32 @@ int handle_write(char *vm_base, struct vcpu *vcpu)
     return bytes;
 }
 
-void handle_close()
+void handle_close(int *file_fd)
 {
     LOG("Handling close()");
 
-    if (file_fd == -1) {
+    if (*file_fd == -1) {
         LOG("Aborted! No file open");
         return;
     }
 
-    if (close(file_fd) == -1) {
+    if (close(*file_fd) == -1) {
         LOG("Failed! Errno = %d", -errno);
         return;
     }
 
-    file_fd = -1;
+    *file_fd = -1;
 }
 
-int run_vm(char *vm_base, struct vcpu *vcpu, size_t sz)
+int run_vm(struct vexec *v)
 {
     struct kvm_regs regs;
-    uint64_t memval = 0;
-    uint64_t vm_exits = 0;
+
+    struct vcpu *vcpu = &v->vcpu;
+
+    v->retval = 0;
+    v->vm_exits = 0;
+    v->file_fd = -1;
 
     for (;;) {
         if (ioctl(vcpu->fd, KVM_RUN, 0) < 0) {
@@ -297,7 +306,7 @@ int run_vm(char *vm_base, struct vcpu *vcpu, size_t sz)
             exit(1);
         }
 
-        ++vm_exits;
+        ++v->vm_exits;
 
         switch (vcpu->kvm_run->exit_reason) {
         case KVM_EXIT_HLT:
@@ -307,23 +316,23 @@ int run_vm(char *vm_base, struct vcpu *vcpu, size_t sz)
             if (vcpu->kvm_run->io.direction == KVM_EXIT_IO_OUT) {
                 switch (vcpu->kvm_run->io.port) {
                     case PORT_PRINT:
-                        handle_print(vm_base, vcpu);
+                        handle_print(v->host_vm_base, vcpu);
                         break;
 
                     case PORT_OPEN:
-                        retval = handle_open(vm_base, vcpu);
+                        v->retval = handle_open(v->host_vm_base, vcpu, &v->file_fd);
                         break;
 
                     case PORT_READ:
-                        retval = handle_read(vm_base, vcpu);
+                        v->retval = handle_read(v->host_vm_base, vcpu, &v->file_fd);
                         break;
 
                     case PORT_WRITE:
-                        retval = handle_write(vm_base, vcpu);
+                        v->retval = handle_write(v->host_vm_base, vcpu, &v->file_fd);
                         break;
 
                     case PORT_CLOSE:
-                        handle_close();
+                        handle_close(&v->file_fd);
                         break;
 
                     default:
@@ -335,11 +344,11 @@ int run_vm(char *vm_base, struct vcpu *vcpu, size_t sz)
             } else if (vcpu->kvm_run->io.direction == KVM_EXIT_IO_IN) {
                 switch (vcpu->kvm_run->io.port) {
                     case PORT_RETVAL:
-                        put_u32(vcpu, retval);
+                        put_u32(vcpu, v->retval);
                         break;
 
                     case PORT_EXITS:
-                        put_u32(vcpu, vm_exits);
+                        put_u32(vcpu, v->vm_exits);
                         break;
 
                     default:
@@ -370,22 +379,17 @@ int run_vm(char *vm_base, struct vcpu *vcpu, size_t sz)
         return 1;
     }
 
-    memcpy(&memval, &vm_base[0x400], sz);
-    if (memval != 42) {
-        printf("Wrong result: memory at 0x400 is %lld\n",
-               (unsigned long long)memval);
-        return 1;
-    }
-
     return 0;
 }
 
 extern const unsigned char guest64[], guest64_end[];
 
-static void setup_64bit_code_segment(struct kvm_sregs *sregs)
+static void setup_64bit_code_segment(uint64_t guest_vm_offset, struct kvm_sregs *sregs)
 {
+    LOG("SEGMENT: 0x%lx", guest_vm_offset);
+
     struct kvm_segment seg = {
-        .base = 0,
+        .base = guest_vm_offset,
         .limit = 0xffffffff,
         .selector = 1 << 3,
         .present = 1,
@@ -404,16 +408,23 @@ static void setup_64bit_code_segment(struct kvm_sregs *sregs)
     sregs->ds = sregs->es = sregs->fs = sregs->gs = sregs->ss = seg;
 }
 
-static void setup_long_mode(char *vm_base, struct kvm_sregs *sregs)
+static void setup_long_mode(char *host_vm_base, uint64_t guest_vm_offset,
+        struct kvm_sregs *sregs)
 {
-    uint64_t pml4_addr = 0x2000;
-    uint64_t *pml4 = (void *)(vm_base + pml4_addr);
+    uint64_t pml4_offset = 0x2000;
+    uint64_t pml4_addr = guest_vm_offset + pml4_offset;
+    uint64_t *pml4 = (uint64_t *)(host_vm_base + pml4_offset);
 
-    uint64_t pdpt_addr = 0x3000;
-    uint64_t *pdpt = (void *)(vm_base + pdpt_addr);
+    uint64_t pdpt_offset = pml4_offset + 0x1000;
+    uint64_t pdpt_addr = guest_vm_offset + pdpt_offset;
+    uint64_t *pdpt = (uint64_t *)(host_vm_base + pdpt_offset);
 
-    uint64_t pd_addr = 0x4000;
-    uint64_t *pd = (void *)(vm_base + pd_addr);
+    uint64_t pd_offset = pdpt_offset + 0x1000;
+    uint64_t pd_addr = guest_vm_offset + pd_offset;
+    uint64_t *pd = (uint64_t *)(host_vm_base + pd_offset);
+
+    LOG("BASE[%p] -> PML4[%p/0x%lx] -> PDPT[%p/0x%lx] -> PD[%p/0x%lx]",
+        host_vm_base, pml4, pml4_addr, pdpt, pdpt_addr, pd, pd_addr);
 
     pml4[0] = PDE64_PRESENT | PDE64_RW | PDE64_USER | pdpt_addr;
     pdpt[0] = PDE64_PRESENT | PDE64_RW | PDE64_USER | pd_addr;
@@ -425,22 +436,24 @@ static void setup_long_mode(char *vm_base, struct kvm_sregs *sregs)
         = CR0_PE | CR0_MP | CR0_ET | CR0_NE | CR0_WP | CR0_AM | CR0_PG;
     sregs->efer = EFER_LME | EFER_LMA;
 
-    setup_64bit_code_segment(sregs);
+    setup_64bit_code_segment(guest_vm_offset, sregs);
 }
 
-int run_long_mode(char *vm_base, struct vcpu *vcpu)
+int run_long_mode(struct vexec *v)
 {
     struct kvm_sregs sregs;
     struct kvm_regs regs;
 
     printf("Testing 64-bit mode\n");
 
+    struct vcpu *vcpu = &v->vcpu;
+
     if (ioctl(vcpu->fd, KVM_GET_SREGS, &sregs) < 0) {
         perror("KVM_GET_SREGS");
         exit(1);
     }
 
-    setup_long_mode(vm_base, &sregs);
+    setup_long_mode(v->host_vm_base, v->guest_vm_offset, &sregs);
 
     if (ioctl(vcpu->fd, KVM_SET_SREGS, &sregs) < 0) {
         perror("KVM_SET_SREGS");
@@ -450,24 +463,21 @@ int run_long_mode(char *vm_base, struct vcpu *vcpu)
     memset(&regs, 0, sizeof(regs));
     /* Clear all FLAGS bits, except bit 1 which is always set. */
     regs.rflags = 2;
-    regs.rip = 0;
+    regs.rip = v->guest_vm_offset + 0;
     /* Create stack at top of 2 MB page and grow down. */
-    regs.rsp = 2 << 20;
+    regs.rsp = v->guest_vm_offset + (2 << 20);
+
+    LOG("RIP: 0x%llx, RSP: 0x%llx", regs.rip, regs.rsp);
 
     if (ioctl(vcpu->fd, KVM_SET_REGS, &regs) < 0) {
         perror("KVM_SET_REGS");
         exit(1);
     }
 
-    memcpy(vm_base, guest64, guest64_end-guest64);
-    return run_vm(vm_base, vcpu, 8);
+    LOG("COPY CODE: %p", v->host_vm_base);
+    memcpy(v->host_vm_base, guest64, guest64_end - guest64);
+    return run_vm(v);
 }
-
-struct vexec {
-    pthread_t thread_id;
-    struct vcpu vcpu;
-    char *vm_base;
-};
 
 void* run_thread(void *args) {
     if (!args) {
@@ -475,7 +485,7 @@ void* run_thread(void *args) {
     }
 
     struct vexec *v = (struct vexec *)args;
-    if (run_long_mode(v->vm_base, &v->vcpu)) {
+    if (run_long_mode(v)) {
         return THREAD_ERR;
     }
 
@@ -484,7 +494,7 @@ void* run_thread(void *args) {
 
 int main()
 {
-    static const size_t CPUS = 1;
+    static const size_t CPUS = 2;
     static const size_t VM_SIZE = 0x200000;
 
     int err;
@@ -498,8 +508,9 @@ int main()
 
     for (size_t i = 0; i < CPUS; ++i) {
         struct vexec *v = &vexec[i];
-        vcpu_init(&vm, &v->vcpu);
-        v->vm_base = &vm.mem[i * VM_SIZE];
+        vcpu_init(&vm, &v->vcpu, i);
+        v->guest_vm_offset = i * VM_SIZE;
+        v->host_vm_base = &vm.mem[v->guest_vm_offset];
     }
 
     for (size_t i = 0; i < CPUS; ++i) {

@@ -146,8 +146,6 @@ _start(void) {
     close();
 
 exit:
-    *(long *) 0x400 = 42;
-
     for (;;)
         asm("hlt" : /* empty */ : "a" (42) : "memory");
 }
