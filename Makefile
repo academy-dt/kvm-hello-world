@@ -5,7 +5,7 @@ run: kvm-hello-world
 	./kvm-hello-world
 
 kvm-hello-world: kvm-hello-world.o payload.o
-	$(CC) $^ -o $@
+	$(CC) $^ -o $@ -lpthread
 
 payload.o: payload.ld guest16.o guest32.img.o guest64.img.o
 	$(LD) -T $< -o $@

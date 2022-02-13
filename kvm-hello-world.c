@@ -7,6 +7,7 @@
 #include <sys/mman.h>
 #include <string.h>
 #include <stdint.h>
+#include <pthread.h>
 #include <linux/kvm.h>
 
 #include "shared.h"
@@ -113,8 +114,8 @@ void vm_init(struct vm *vm, size_t mem_size)
         exit(1);
     }
 
-        if (ioctl(vm->fd, KVM_SET_TSS_ADDR, 0xfffbd000) < 0) {
-                perror("KVM_SET_TSS_ADDR");
+    if (ioctl(vm->fd, KVM_SET_TSS_ADDR, 0xfffbd000) < 0) {
+        perror("KVM_SET_TSS_ADDR");
         exit(1);
     }
 
@@ -132,9 +133,9 @@ void vm_init(struct vm *vm, size_t mem_size)
     memreg.guest_phys_addr = 0;
     memreg.memory_size = mem_size;
     memreg.userspace_addr = (unsigned long)vm->mem;
-        if (ioctl(vm->fd, KVM_SET_USER_MEMORY_REGION, &memreg) < 0) {
+    if (ioctl(vm->fd, KVM_SET_USER_MEMORY_REGION, &memreg) < 0) {
         perror("KVM_SET_USER_MEMORY_REGION");
-                exit(1);
+        exit(1);
     }
 }
 
@@ -145,18 +146,16 @@ struct vcpu {
 
 void vcpu_init(struct vm *vm, struct vcpu *vcpu)
 {
-    int vcpu_mmap_size;
-
     vcpu->fd = ioctl(vm->fd, KVM_CREATE_VCPU, 0);
-        if (vcpu->fd < 0) {
+    if (vcpu->fd < 0) {
         perror("KVM_CREATE_VCPU");
-                exit(1);
+        exit(1);
     }
 
-    vcpu_mmap_size = ioctl(vm->sys_fd, KVM_GET_VCPU_MMAP_SIZE, 0);
-        if (vcpu_mmap_size <= 0) {
+    int vcpu_mmap_size = ioctl(vm->sys_fd, KVM_GET_VCPU_MMAP_SIZE, 0);
+    if (vcpu_mmap_size <= 0) {
         perror("KVM_GET_VCPU_MMAP_SIZE");
-                exit(1);
+        exit(1);
     }
 
     vcpu->kvm_run = mmap(NULL, vcpu_mmap_size, PROT_READ | PROT_WRITE,
@@ -372,17 +371,17 @@ int run_vm(struct vm *vm, struct vcpu *vcpu, size_t sz)
 
     if (regs.rax != 42) {
         printf("Wrong result: {E,R,}AX is %lld\n", regs.rax);
-        return 0;
+        return 1;
     }
 
     memcpy(&memval, &vm->mem[0x400], sz);
     if (memval != 42) {
         printf("Wrong result: memory at 0x400 is %lld\n",
                (unsigned long long)memval);
-        return 0;
+        return 1;
     }
 
-    return 1;
+    return 0;
 }
 
 extern const unsigned char guest64[], guest64_end[];
@@ -440,14 +439,14 @@ int run_long_mode(struct vm *vm, struct vcpu *vcpu)
 
     printf("Testing 64-bit mode\n");
 
-        if (ioctl(vcpu->fd, KVM_GET_SREGS, &sregs) < 0) {
+    if (ioctl(vcpu->fd, KVM_GET_SREGS, &sregs) < 0) {
         perror("KVM_GET_SREGS");
         exit(1);
     }
 
     setup_long_mode(vm, &sregs);
 
-        if (ioctl(vcpu->fd, KVM_SET_SREGS, &sregs) < 0) {
+    if (ioctl(vcpu->fd, KVM_SET_SREGS, &sregs) < 0) {
         perror("KVM_SET_SREGS");
         exit(1);
     }
@@ -468,16 +467,56 @@ int run_long_mode(struct vm *vm, struct vcpu *vcpu)
     return run_vm(vm, vcpu, 8);
 }
 
+struct exec_thread {
+    struct vm *vm;
+    struct vcpu *vcpu;
+};
+
+void* run_thread(void *args) {
+    if (!args) {
+        return (void *)1;
+    }
+
+    struct exec_thread *et = (struct exec_thread *)args;
+    return run_long_mode(et->vm, et->vcpu) == 0 ? 0 : (void *)1;
+}
 
 int main()
 {
+    int err;
+
     struct vm vm;
     struct vcpu vcpu;
 
-    printf("PID = %d\n", getpid());
+    pthread_t thread;
 
-    vm_init(&vm, 0x200000);
+    LOG("PID = %d", getpid());
+
+    vm_init(&vm, 0x400000);
     vcpu_init(&vm, &vcpu);
 
-    return !run_long_mode(&vm, &vcpu);
+    struct exec_thread et = {
+        .vm = &vm,
+        .vcpu = &vcpu
+    };
+
+    err = pthread_create(&thread, NULL, run_thread, &et);
+    if (err) {
+        LOG("Create thread failed, err = %d", err);
+        return 1;
+    }
+
+    void *thread_retval;;
+    err = pthread_join(thread, &thread_retval);
+    if (err) {
+        LOG("Join thread failed, err = %d", err);
+        return 1;
+    }
+
+    if (thread_retval != 0) {
+        LOG("Run failed");
+        return 1;
+    }
+
+    return 0;
 }
