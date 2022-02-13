@@ -1,6 +1,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "shared.h"
+
 static inline uint32_t inb(uint16_t port) {
     uint32_t ret;
     asm("in %1, %0" : "=a"(ret) : "Nd"(port) : "memory" );
@@ -41,15 +43,13 @@ static int u32toa(uint32_t x, char *buffer, size_t len) {
 }
 
 static void print(const void *str) {
-    static const uint16_t PORT = 0xEA;
-
     /*
      * Because the entire memory space is 2MB,
      * we can refer only to the lowest 32bit
      */
     intptr_t ptr = (intptr_t)str;
     uint32_t low = (uint32_t)(ptr & 0xFFFFFFFF);
-    outb(PORT, low);
+    outb(PORT_PRINT, low);
 }
 
 static void print_u32(uint32_t num) {
@@ -68,9 +68,7 @@ static void generate_exits(unsigned count) {
 }
 
 static uint32_t exits(void) {
-    static const uint16_t PORT = 0xEB;
-
-    return inb(PORT);
+    return inb(PORT_EXITS);
 }
 
 void

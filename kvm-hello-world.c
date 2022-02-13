@@ -9,6 +9,8 @@
 #include <stdint.h>
 #include <linux/kvm.h>
 
+#include "shared.h"
+
 /* CR0 bits */
 #define CR0_PE 1u
 #define CR0_MP (1U << 1)
@@ -201,11 +203,7 @@ int run_vm(struct vm *vm, struct vcpu *vcpu, size_t sz)
 
         case KVM_EXIT_IO:
             if (vcpu->kvm_run->io.direction == KVM_EXIT_IO_OUT) {
-                if (vcpu->kvm_run->io.port == 0xE9) {
-                    char *p = (char *)vcpu->kvm_run;
-                    fwrite(p + vcpu->kvm_run->io.data_offset,
-                           vcpu->kvm_run->io.size, 1, stdout);
-                } else if (vcpu->kvm_run->io.port == 0xEA) {
+                if (vcpu->kvm_run->io.port == PORT_PRINT) {
                     int32_t offset = kvm_data_get_u32(vcpu);
                     char *str = guest2host(vm, offset);
                     fprintf(stdout, "%s\n", str);
@@ -214,7 +212,7 @@ int run_vm(struct vm *vm, struct vcpu *vcpu, size_t sz)
                 fflush(stdout);
                 continue;
             } else if (vcpu->kvm_run->io.direction == KVM_EXIT_IO_IN) {
-                if (vcpu->kvm_run->io.port == 0xEB) {
+                if (vcpu->kvm_run->io.port == PORT_EXITS) {
                     kvm_data_set_u32(vcpu, vm_exits);
                 }
 
