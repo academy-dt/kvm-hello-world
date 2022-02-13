@@ -2,7 +2,7 @@ CFLAGS = -Wall -Wextra -Werror -O2
 
 .PHONY: run
 run: kvm-hello-world
-	./kvm-hello-world -l
+	./kvm-hello-world
 
 kvm-hello-world: kvm-hello-world.o payload.o
 	$(CC) $^ -o $@
