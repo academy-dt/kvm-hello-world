@@ -66,6 +66,8 @@
 #define PDE64_PS (1U << 7)
 #define PDE64_G (1U << 8)
 
+#define THREAD_ERR ((void *)1)
+
 #define LOG(fmt, ...) \
     do { \
         fprintf(stdout, fmt "\n", ##__VA_ARGS__); \
@@ -467,53 +469,54 @@ int run_long_mode(struct vm *vm, struct vcpu *vcpu)
     return run_vm(vm, vcpu, 8);
 }
 
-struct exec_thread {
+struct vexec {
+    pthread_t thread_id;
+    struct vcpu vcpu;
     struct vm *vm;
-    struct vcpu *vcpu;
 };
 
 void* run_thread(void *args) {
     if (!args) {
-        return (void *)1;
+        return THREAD_ERR;
     }
 
-    struct exec_thread *et = (struct exec_thread *)args;
-    return run_long_mode(et->vm, et->vcpu) == 0 ? 0 : (void *)1;
+    struct vexec *v = (struct vexec *)args;
+    if (run_long_mode(v->vm, &v->vcpu)) {
+        return THREAD_ERR;
+    }
+
+    return 0;
 }
 
 int main()
 {
+    static const size_t VM_SIZE = 0x200000;
+
     int err;
 
     struct vm vm;
-    struct vcpu vcpu;
-
-    pthread_t thread;
+    struct vexec vexec;
 
     LOG("PID = %d", getpid());
 
-    vm_init(&vm, 0x400000);
-    vcpu_init(&vm, &vcpu);
+    vm_init(&vm, VM_SIZE);
+    vcpu_init(&vm, &vexec.vcpu);
+    vexec.vm = &vm;
 
-    struct exec_thread et = {
-        .vm = &vm,
-        .vcpu = &vcpu
-    };
-
-    err = pthread_create(&thread, NULL, run_thread, &et);
+    err = pthread_create(&vexec.thread_id, NULL, run_thread, &vexec);
     if (err) {
         LOG("Create thread failed, err = %d", err);
         return 1;
     }
 
-    void *thread_retval;;
-    err = pthread_join(thread, &thread_retval);
+    void *retval;
+    err = pthread_join(vexec.thread_id, &retval);
     if (err) {
         LOG("Join thread failed, err = %d", err);
         return 1;
     }
 
-    if (thread_retval != 0) {
+    if (retval != 0) {
         LOG("Run failed");
         return 1;
     }
