@@ -76,6 +76,7 @@
  * This is the FD for that file.
  */
 static int file_fd = -1;
+static int retval = 0;
 
 struct vm {
     int sys_fd;
@@ -166,79 +167,127 @@ void vcpu_init(struct vm *vm, struct vcpu *vcpu)
     }
 }
 
-// Get IO data as uint32_t
-uint32_t kvm_data_get_u32(struct vcpu *vcpu)
-{
-    char *raw_ptr = (char *)vcpu->kvm_run + vcpu->kvm_run->io.data_offset;
-    uint32_t *value_ptr = (uint32_t *)raw_ptr;
-    return *value_ptr;
-}
-
-// Set IO data as uint32_t
-void kvm_data_set_u32(struct vcpu *vcpu, uint32_t value)
-{
-    char *raw_ptr = (char *)vcpu->kvm_run + vcpu->kvm_run->io.data_offset;
-    uint32_t *value_ptr = (uint32_t *)raw_ptr;
-    *value_ptr = value;
-}
-
-// Get IO data as char *
-char* kvm_data_str(struct vcpu *vcpu)
-{
-    return (char *)vcpu->kvm_run + vcpu->kvm_run->io.data_offset;
-}
-
 // Get a pointer to the guest's memory from the hosts perspective
 void *guest2host(struct vm *vm, uint64_t offset)
 {
     return (char *)vm->mem + offset;
 }
 
+uint32_t get_u32(struct vcpu *vcpu)
+{
+    char *raw_ptr = (char *)vcpu->kvm_run + vcpu->kvm_run->io.data_offset;
+    uint32_t *value_ptr = (uint32_t *)raw_ptr;
+    return *value_ptr;
+}
+
 char *get_string(struct vm *vm, struct vcpu *vcpu)
 {
-    int32_t offset = kvm_data_get_u32(vcpu);
+    uint32_t offset = get_u32(vcpu);
     return guest2host(vm, offset);
+}
+
+void get_buf_len(struct vm *vm, struct vcpu *vcpu, void **buf, int *len)
+{
+    uint32_t value = get_u32(vcpu);
+    *len = value & LEN_MASK;
+
+    uint32_t offset = value >> LEN_BITS;
+    *buf = guest2host(vm, offset);
+}
+
+void put_u32(struct vcpu *vcpu, uint32_t value)
+{
+    char *raw_ptr = (char *)vcpu->kvm_run + vcpu->kvm_run->io.data_offset;
+    uint32_t *value_ptr = (uint32_t *)raw_ptr;
+    *value_ptr = value;
 }
 
 void handle_print(struct vm *vm, struct vcpu *vcpu)
 {
     char *str = get_string(vm, vcpu);
-    LOG("%s", str);
+    LOG("Guest: %s", str);
 }
 
 int handle_open(struct vm *vm, struct vcpu *vcpu)
 {
     char *path = get_string(vm, vcpu);
+    LOG("Handling open(%s)", path);
+
     if (file_fd != -1) {
-        LOG("open(%s) failed! file already open", path);
+        LOG("Failed! Already open");
         return -EALREADY;
     }
 
-    file_fd = open(path, O_RDWR);
+    /*
+     * Note: We chose O_CREATE and O_APPEND just because that was convenient for testing.
+     * Any set of flags should work here.
+     */
+    file_fd = open(path, O_RDWR | O_CREAT | O_APPEND, 0666);
     if (file_fd == -1) {
-        LOG("open(%s) failed! %d", path, -errno);
+        LOG("Failed! Errno = %d", -errno);
         return -errno;
     }
 
-    LOG("open(%s) = %d", path, file_fd);
     return 0;
+}
+
+int handle_read(struct vm *vm, struct vcpu *vcpu)
+{
+    void *buf;
+    int len;
+    get_buf_len(vm, vcpu, &buf, &len);
+    LOG("Handling read(%p, %d)", buf, len);
+
+    if (file_fd == -1) {
+        LOG("Failed! No file open");
+        return -EINVAL;
+    }
+
+    int bytes = read(file_fd, buf, len);
+    if (bytes == -1) {
+        LOG("Failed! Errno = %d", -errno);
+        return -errno;
+    }
+
+    return bytes;
+}
+
+int handle_write(struct vm *vm, struct vcpu *vcpu)
+{
+    void *buf;
+    int len;
+    get_buf_len(vm, vcpu, &buf, &len);
+    LOG("Handling write(%p, %d)", buf, len);
+
+    if (file_fd == -1) {
+        LOG("Failed! No file open");
+        return -EINVAL;
+    }
+
+    int bytes = write(file_fd, buf, len);
+    if (bytes == -1) {
+        LOG("Failed! Errno = %d", -errno);
+        return -errno;
+    }
+
+    return bytes;
 }
 
 void handle_close()
 {
+    LOG("Handling close()");
+
     if (file_fd == -1) {
-        LOG("close() aborted! no file open");
+        LOG("Aborted! No file open");
         return;
     }
 
-    int rv = close(file_fd);
-    LOG("close(%d) = %d", file_fd, rv);
-    file_fd = -1;
-}
+    if (close(file_fd) == -1) {
+        LOG("Failed! Errno = %d", -errno);
+        return;
+    }
 
-void handle_exits(struct vcpu *vcpu, uint64_t vm_exits)
-{
-    kvm_data_set_u32(vcpu, vm_exits);
+    file_fd = -1;
 }
 
 int run_vm(struct vm *vm, struct vcpu *vcpu, size_t sz)
@@ -267,7 +316,15 @@ int run_vm(struct vm *vm, struct vcpu *vcpu, size_t sz)
                         break;
 
                     case PORT_OPEN:
-                        handle_open(vm, vcpu);
+                        retval = handle_open(vm, vcpu);
+                        break;
+
+                    case PORT_READ:
+                        retval = handle_read(vm, vcpu);
+                        break;
+
+                    case PORT_WRITE:
+                        retval = handle_write(vm, vcpu);
                         break;
 
                     case PORT_CLOSE:
@@ -282,8 +339,12 @@ int run_vm(struct vm *vm, struct vcpu *vcpu, size_t sz)
                 continue;
             } else if (vcpu->kvm_run->io.direction == KVM_EXIT_IO_IN) {
                 switch (vcpu->kvm_run->io.port) {
+                    case PORT_RETVAL:
+                        put_u32(vcpu, retval);
+                        break;
+
                     case PORT_EXITS:
-                        handle_exits(vcpu, vm_exits);
+                        put_u32(vcpu, vm_exits);
                         break;
 
                     default:
