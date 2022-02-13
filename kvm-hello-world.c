@@ -484,35 +484,46 @@ void* run_thread(void *args) {
 
 int main()
 {
+    static const size_t CPUS = 1;
     static const size_t VM_SIZE = 0x200000;
 
     int err;
 
     struct vm vm;
-    struct vexec vexec;
+    struct vexec vexec[CPUS];
 
     LOG("PID = %d", getpid());
 
-    vm_init(&vm, VM_SIZE);
-    vcpu_init(&vm, &vexec.vcpu);
-    vexec.vm_base = vm.mem;
+    vm_init(&vm, CPUS * VM_SIZE);
 
-    err = pthread_create(&vexec.thread_id, NULL, run_thread, &vexec);
-    if (err) {
-        LOG("Create thread failed, err = %d", err);
-        return 1;
+    for (size_t i = 0; i < CPUS; ++i) {
+        struct vexec *v = &vexec[i];
+        vcpu_init(&vm, &v->vcpu);
+        v->vm_base = &vm.mem[i * VM_SIZE];
     }
 
-    void *retval;
-    err = pthread_join(vexec.thread_id, &retval);
-    if (err) {
-        LOG("Join thread failed, err = %d", err);
-        return 1;
+    for (size_t i = 0; i < CPUS; ++i) {
+        struct vexec *v = &vexec[i];
+        err = pthread_create(&v->thread_id, NULL, run_thread, v);
+        if (err) {
+            LOG("Create thread failed, err = %d", err);
+            return 1;
+        }
     }
 
-    if (retval != 0) {
-        LOG("Run failed");
-        return 1;
+    for (size_t i = 0; i < CPUS; ++i) {
+        void *retval;
+        struct vexec *v = &vexec[i];
+        err = pthread_join(v->thread_id, &retval);
+        if (err) {
+            LOG("Join thread failed, err = %d", err);
+            return 1;
+        }
+
+        if (retval != 0) {
+            LOG("Run failed");
+            return 1;
+        }
     }
 
     return 0;
