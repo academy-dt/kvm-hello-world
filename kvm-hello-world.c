@@ -168,12 +168,6 @@ void vcpu_init(struct vm *vm, struct vcpu *vcpu)
     }
 }
 
-// Get a pointer to the guest's memory from the hosts perspective
-void *guest2host(struct vm *vm, uint64_t offset)
-{
-    return (char *)vm->mem + offset;
-}
-
 uint32_t get_u32(struct vcpu *vcpu)
 {
     char *raw_ptr = (char *)vcpu->kvm_run + vcpu->kvm_run->io.data_offset;
@@ -181,19 +175,19 @@ uint32_t get_u32(struct vcpu *vcpu)
     return *value_ptr;
 }
 
-char *get_string(struct vm *vm, struct vcpu *vcpu)
+char *get_string(char *vm_base, struct vcpu *vcpu)
 {
     uint32_t offset = get_u32(vcpu);
-    return guest2host(vm, offset);
+    return vm_base + offset;
 }
 
-void get_buf_len(struct vm *vm, struct vcpu *vcpu, void **buf, int *len)
+void get_buf_len(char *vm_base, struct vcpu *vcpu, void **buf, int *len)
 {
     uint32_t value = get_u32(vcpu);
     *len = value & LEN_MASK;
 
     uint32_t offset = value >> LEN_BITS;
-    *buf = guest2host(vm, offset);
+    *buf = vm_base + offset;
 }
 
 void put_u32(struct vcpu *vcpu, uint32_t value)
@@ -203,15 +197,15 @@ void put_u32(struct vcpu *vcpu, uint32_t value)
     *value_ptr = value;
 }
 
-void handle_print(struct vm *vm, struct vcpu *vcpu)
+void handle_print(char *vm_base, struct vcpu *vcpu)
 {
-    char *str = get_string(vm, vcpu);
+    char *str = get_string(vm_base, vcpu);
     LOG("Guest: %s", str);
 }
 
-int handle_open(struct vm *vm, struct vcpu *vcpu)
+int handle_open(char *vm_base, struct vcpu *vcpu)
 {
-    char *path = get_string(vm, vcpu);
+    char *path = get_string(vm_base, vcpu);
     LOG("Handling open(%s)", path);
 
     if (file_fd != -1) {
@@ -232,11 +226,11 @@ int handle_open(struct vm *vm, struct vcpu *vcpu)
     return 0;
 }
 
-int handle_read(struct vm *vm, struct vcpu *vcpu)
+int handle_read(char *vm_base, struct vcpu *vcpu)
 {
     void *buf;
     int len;
-    get_buf_len(vm, vcpu, &buf, &len);
+    get_buf_len(vm_base, vcpu, &buf, &len);
     LOG("Handling read(%p, %d)", buf, len);
 
     if (file_fd == -1) {
@@ -253,11 +247,11 @@ int handle_read(struct vm *vm, struct vcpu *vcpu)
     return bytes;
 }
 
-int handle_write(struct vm *vm, struct vcpu *vcpu)
+int handle_write(char *vm_base, struct vcpu *vcpu)
 {
     void *buf;
     int len;
-    get_buf_len(vm, vcpu, &buf, &len);
+    get_buf_len(vm_base, vcpu, &buf, &len);
     LOG("Handling write(%p, %d)", buf, len);
 
     if (file_fd == -1) {
@@ -291,7 +285,7 @@ void handle_close()
     file_fd = -1;
 }
 
-int run_vm(struct vm *vm, struct vcpu *vcpu, size_t sz)
+int run_vm(char *vm_base, struct vcpu *vcpu, size_t sz)
 {
     struct kvm_regs regs;
     uint64_t memval = 0;
@@ -313,19 +307,19 @@ int run_vm(struct vm *vm, struct vcpu *vcpu, size_t sz)
             if (vcpu->kvm_run->io.direction == KVM_EXIT_IO_OUT) {
                 switch (vcpu->kvm_run->io.port) {
                     case PORT_PRINT:
-                        handle_print(vm, vcpu);
+                        handle_print(vm_base, vcpu);
                         break;
 
                     case PORT_OPEN:
-                        retval = handle_open(vm, vcpu);
+                        retval = handle_open(vm_base, vcpu);
                         break;
 
                     case PORT_READ:
-                        retval = handle_read(vm, vcpu);
+                        retval = handle_read(vm_base, vcpu);
                         break;
 
                     case PORT_WRITE:
-                        retval = handle_write(vm, vcpu);
+                        retval = handle_write(vm_base, vcpu);
                         break;
 
                     case PORT_CLOSE:
@@ -376,7 +370,7 @@ int run_vm(struct vm *vm, struct vcpu *vcpu, size_t sz)
         return 1;
     }
 
-    memcpy(&memval, &vm->mem[0x400], sz);
+    memcpy(&memval, &vm_base[0x400], sz);
     if (memval != 42) {
         printf("Wrong result: memory at 0x400 is %lld\n",
                (unsigned long long)memval);
@@ -410,16 +404,16 @@ static void setup_64bit_code_segment(struct kvm_sregs *sregs)
     sregs->ds = sregs->es = sregs->fs = sregs->gs = sregs->ss = seg;
 }
 
-static void setup_long_mode(struct vm *vm, struct kvm_sregs *sregs)
+static void setup_long_mode(char *vm_base, struct kvm_sregs *sregs)
 {
     uint64_t pml4_addr = 0x2000;
-    uint64_t *pml4 = (void *)(vm->mem + pml4_addr);
+    uint64_t *pml4 = (void *)(vm_base + pml4_addr);
 
     uint64_t pdpt_addr = 0x3000;
-    uint64_t *pdpt = (void *)(vm->mem + pdpt_addr);
+    uint64_t *pdpt = (void *)(vm_base + pdpt_addr);
 
     uint64_t pd_addr = 0x4000;
-    uint64_t *pd = (void *)(vm->mem + pd_addr);
+    uint64_t *pd = (void *)(vm_base + pd_addr);
 
     pml4[0] = PDE64_PRESENT | PDE64_RW | PDE64_USER | pdpt_addr;
     pdpt[0] = PDE64_PRESENT | PDE64_RW | PDE64_USER | pd_addr;
@@ -434,7 +428,7 @@ static void setup_long_mode(struct vm *vm, struct kvm_sregs *sregs)
     setup_64bit_code_segment(sregs);
 }
 
-int run_long_mode(struct vm *vm, struct vcpu *vcpu)
+int run_long_mode(char *vm_base, struct vcpu *vcpu)
 {
     struct kvm_sregs sregs;
     struct kvm_regs regs;
@@ -446,7 +440,7 @@ int run_long_mode(struct vm *vm, struct vcpu *vcpu)
         exit(1);
     }
 
-    setup_long_mode(vm, &sregs);
+    setup_long_mode(vm_base, &sregs);
 
     if (ioctl(vcpu->fd, KVM_SET_SREGS, &sregs) < 0) {
         perror("KVM_SET_SREGS");
@@ -465,14 +459,14 @@ int run_long_mode(struct vm *vm, struct vcpu *vcpu)
         exit(1);
     }
 
-    memcpy(vm->mem, guest64, guest64_end-guest64);
-    return run_vm(vm, vcpu, 8);
+    memcpy(vm_base, guest64, guest64_end-guest64);
+    return run_vm(vm_base, vcpu, 8);
 }
 
 struct vexec {
     pthread_t thread_id;
     struct vcpu vcpu;
-    struct vm *vm;
+    char *vm_base;
 };
 
 void* run_thread(void *args) {
@@ -481,7 +475,7 @@ void* run_thread(void *args) {
     }
 
     struct vexec *v = (struct vexec *)args;
-    if (run_long_mode(v->vm, &v->vcpu)) {
+    if (run_long_mode(v->vm_base, &v->vcpu)) {
         return THREAD_ERR;
     }
 
@@ -501,7 +495,7 @@ int main()
 
     vm_init(&vm, VM_SIZE);
     vcpu_init(&vm, &vexec.vcpu);
-    vexec.vm = &vm;
+    vexec.vm_base = vm.mem;
 
     err = pthread_create(&vexec.thread_id, NULL, run_thread, &vexec);
     if (err) {
