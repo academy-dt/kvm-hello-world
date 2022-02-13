@@ -65,6 +65,17 @@
 #define PDE64_PS (1U << 7)
 #define PDE64_G (1U << 8)
 
+#define LOG(fmt, ...) \
+    do { \
+        fprintf(stdout, fmt "\n", ##__VA_ARGS__); \
+        fflush(stdout); \
+    } while(0)
+
+/*
+ * We assume that only a single "host"-file can be opened by the guest.
+ * This is the FD for that file.
+ */
+static int file_fd = -1;
 
 struct vm {
     int sys_fd;
@@ -183,12 +194,46 @@ void *guest2host(struct vm *vm, uint64_t offset)
     return (char *)vm->mem + offset;
 }
 
-void handle_print(struct vm *vm, struct vcpu *vcpu)
+char *get_string(struct vm *vm, struct vcpu *vcpu)
 {
     int32_t offset = kvm_data_get_u32(vcpu);
-    char *str = guest2host(vm, offset);
-    fprintf(stdout, "%s\n", str);
-    fflush(stdout);
+    return guest2host(vm, offset);
+}
+
+void handle_print(struct vm *vm, struct vcpu *vcpu)
+{
+    char *str = get_string(vm, vcpu);
+    LOG("%s", str);
+}
+
+int handle_open(struct vm *vm, struct vcpu *vcpu)
+{
+    char *path = get_string(vm, vcpu);
+    if (file_fd != -1) {
+        LOG("open(%s) failed! file already open", path);
+        return -EALREADY;
+    }
+
+    file_fd = open(path, O_RDWR);
+    if (file_fd == -1) {
+        LOG("open(%s) failed! %d", path, -errno);
+        return -errno;
+    }
+
+    LOG("open(%s) = %d", path, file_fd);
+    return 0;
+}
+
+void handle_close()
+{
+    if (file_fd == -1) {
+        LOG("close() aborted! no file open");
+        return;
+    }
+
+    int rv = close(file_fd);
+    LOG("close(%d) = %d", file_fd, rv);
+    file_fd = -1;
 }
 
 void handle_exits(struct vcpu *vcpu, uint64_t vm_exits)
@@ -216,24 +261,36 @@ int run_vm(struct vm *vm, struct vcpu *vcpu, size_t sz)
 
         case KVM_EXIT_IO:
             if (vcpu->kvm_run->io.direction == KVM_EXIT_IO_OUT) {
-                if (vcpu->kvm_run->io.port == PORT_PRINT) {
-                    handle_print(vm, vcpu);
-                } else {
-                    fprintf(stderr, "Got EXIT_IO_OUT from unknown port %d",
-                            vcpu->kvm_run->io.port);
-                    exit(1);
-                }
+                switch (vcpu->kvm_run->io.port) {
+                    case PORT_PRINT:
+                        handle_print(vm, vcpu);
+                        break;
 
+                    case PORT_OPEN:
+                        handle_open(vm, vcpu);
+                        break;
+
+                    case PORT_CLOSE:
+                        handle_close();
+                        break;
+
+                    default:
+                        fprintf(stderr, "Got EXIT_IO_OUT from unknown port %d",
+                                vcpu->kvm_run->io.port);
+                        exit(1);
+                }
                 continue;
             } else if (vcpu->kvm_run->io.direction == KVM_EXIT_IO_IN) {
-                if (vcpu->kvm_run->io.port == PORT_EXITS) {
-                    handle_exits(vcpu, vm_exits);
-                } else {
-                    fprintf(stderr, "Got EXIT_IO_IN from unknown port %d",
-                            vcpu->kvm_run->io.port);
-                    exit(1);
-                }
+                switch (vcpu->kvm_run->io.port) {
+                    case PORT_EXITS:
+                        handle_exits(vcpu, vm_exits);
+                        break;
 
+                    default:
+                        fprintf(stderr, "Got EXIT_IO_IN from unknown port %d",
+                                vcpu->kvm_run->io.port);
+                        exit(1);
+                }
                 continue;
             }
 
