@@ -183,6 +183,19 @@ void *guest2host(struct vm *vm, uint64_t offset)
     return (char *)vm->mem + offset;
 }
 
+void handle_print(struct vm *vm, struct vcpu *vcpu)
+{
+    int32_t offset = kvm_data_get_u32(vcpu);
+    char *str = guest2host(vm, offset);
+    fprintf(stdout, "%s\n", str);
+    fflush(stdout);
+}
+
+void handle_exits(struct vcpu *vcpu, uint64_t vm_exits)
+{
+    kvm_data_set_u32(vcpu, vm_exits);
+}
+
 int run_vm(struct vm *vm, struct vcpu *vcpu, size_t sz)
 {
     struct kvm_regs regs;
@@ -204,16 +217,21 @@ int run_vm(struct vm *vm, struct vcpu *vcpu, size_t sz)
         case KVM_EXIT_IO:
             if (vcpu->kvm_run->io.direction == KVM_EXIT_IO_OUT) {
                 if (vcpu->kvm_run->io.port == PORT_PRINT) {
-                    int32_t offset = kvm_data_get_u32(vcpu);
-                    char *str = guest2host(vm, offset);
-                    fprintf(stdout, "%s\n", str);
+                    handle_print(vm, vcpu);
+                } else {
+                    fprintf(stderr, "Got EXIT_IO_OUT from unknown port %d",
+                            vcpu->kvm_run->io.port);
+                    exit(1);
                 }
 
-                fflush(stdout);
                 continue;
             } else if (vcpu->kvm_run->io.direction == KVM_EXIT_IO_IN) {
                 if (vcpu->kvm_run->io.port == PORT_EXITS) {
-                    kvm_data_set_u32(vcpu, vm_exits);
+                    handle_exits(vcpu, vm_exits);
+                } else {
+                    fprintf(stderr, "Got EXIT_IO_IN from unknown port %d",
+                            vcpu->kvm_run->io.port);
+                    exit(1);
                 }
 
                 continue;
